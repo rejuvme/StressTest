@@ -1,0 +1,3 @@
+reports/
+k6/__pycache__/
+*.pyc

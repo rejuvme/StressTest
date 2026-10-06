@@ -6,6 +6,9 @@ param(
   [string]$AccessToken = $env:ACCESS_TOKEN,
 
   [Parameter(Mandatory = $false)]
+  [string]$RefreshToken = $env:REFRESH_TOKEN,
+
+  [Parameter(Mandatory = $false)]
   [string]$SearchQuery = $(if ($env:SEARCH_QUERY) { $env:SEARCH_QUERY } else { 'sleep' }),
 
   [Parameter(Mandatory = $false)]
@@ -28,8 +31,22 @@ function Require-Value($Name, $Value) {
   }
 }
 
+function Require-OneOf($Description, [string[]]$Values) {
+  foreach ($value in $Values) {
+    if (-not [string]::IsNullOrWhiteSpace($value)) {
+      return
+    }
+  }
+
+  throw "Missing required auth input: $Description"
+}
+
 function Safe-Name([string]$s) {
   return ($s -replace '[^A-Za-z0-9._-]', '_')
+}
+
+function Normalize-BaseUrl([string]$Value) {
+  return ($Value ?? '').Trim().TrimEnd('/')
 }
 
 function Get-K6MetricValue($Summary, [string]$MetricName, [string]$Key) {
@@ -52,6 +69,41 @@ function To-Ms($value) {
 function To-Int($value) {
   if ($null -eq $value) { return 'n/a' }
   return ('{0:N0}' -f [double]$value)
+}
+
+function Invoke-RefreshTokenExchange([string]$NormalizedBaseUrl, [string]$CurrentRefreshToken) {
+  Require-Value 'REFRESH_TOKEN' $CurrentRefreshToken
+
+  $uri = "$NormalizedBaseUrl/auth/refresh"
+  $payload = @{ refreshToken = $CurrentRefreshToken } | ConvertTo-Json -Compress
+
+  try {
+    $response = Invoke-RestMethod -Method Post -Uri $uri -ContentType 'application/json' -Body $payload -TimeoutSec 60
+  }
+  catch {
+    $message = $_.Exception.Message
+    if ($_.ErrorDetails.Message) {
+      $message = "$message | $($_.ErrorDetails.Message)"
+    }
+    throw "Refresh token exchange failed at $uri. $message"
+  }
+
+  if ($null -eq $response -or $response.success -ne $true -or $null -eq $response.data) {
+    throw "Refresh token exchange returned an unexpected response from $uri"
+  }
+
+  $newAccessToken = [string]$response.data.accessToken
+  $newRefreshToken = [string]$response.data.refreshToken
+
+  if ([string]::IsNullOrWhiteSpace($newAccessToken) -or [string]::IsNullOrWhiteSpace($newRefreshToken)) {
+    throw 'Refresh token exchange did not return both accessToken and refreshToken'
+  }
+
+  return [pscustomobject]@{
+    AccessToken = $newAccessToken
+    RefreshToken = $newRefreshToken
+    ExpiresIn = $response.data.expiresIn
+  }
 }
 
 function Evaluate-Step($Name, $Summary, [double]$P95LimitMs) {
@@ -87,7 +139,9 @@ function Run-K6Step(
   [string]$Profile,
   [double]$P95LimitMs,
   [hashtable]$ExtraEnv,
-  [string]$RunDir
+  [string]$RunDir,
+  [string]$NormalizedBaseUrl,
+  [string]$CurrentAccessToken
 ) {
   $stepDir = Join-Path $RunDir (Safe-Name $Name)
   New-Item -ItemType Directory -Force -Path $stepDir | Out-Null
@@ -95,8 +149,8 @@ function Run-K6Step(
   $stdoutFile = Join-Path $stepDir 'stdout.log'
   $stderrFile = Join-Path $stepDir 'stderr.log'
 
-  $env:BASE_URL = $BaseUrl
-  $env:ACCESS_TOKEN = $AccessToken
+  $env:BASE_URL = $NormalizedBaseUrl
+  $env:ACCESS_TOKEN = $CurrentAccessToken
   $env:TEST_PROFILE = $Profile
   foreach ($k in $ExtraEnv.Keys) {
     Set-Item -Path "Env:$k" -Value ([string]$ExtraEnv[$k])
@@ -104,6 +158,10 @@ function Run-K6Step(
 
   Write-Host "==> Running $Name ($ScriptFile, profile=$Profile)"
   & k6 run --summary-export "$summaryFile" "$ScriptFile" 1> "$stdoutFile" 2> "$stderrFile"
+
+  if ($LASTEXITCODE -ne 0) {
+    throw "k6 step failed: $Name. See $stderrFile"
+  }
 
   $summary = Get-Content $summaryFile -Raw | ConvertFrom-Json
   $result = Evaluate-Step -Name $Name -Summary $summary -P95LimitMs $P95LimitMs
@@ -123,7 +181,29 @@ function Run-K6Step(
 
 Require-Command 'k6'
 Require-Value 'BASE_URL' $BaseUrl
-Require-Value 'ACCESS_TOKEN' $AccessToken
+Require-OneOf 'ACCESS_TOKEN or REFRESH_TOKEN' @($AccessToken, $RefreshToken)
+
+$normalizedBaseUrl = Normalize-BaseUrl $BaseUrl
+$currentAccessToken = $AccessToken
+$currentRefreshToken = $RefreshToken
+$refreshAttemptCount = 0
+$refreshSuccessCount = 0
+$authMode = if (-not [string]::IsNullOrWhiteSpace($currentRefreshToken)) { 'refresh-token automation' } else { 'access-token only' }
+
+if ([string]::IsNullOrWhiteSpace($currentAccessToken) -and -not [string]::IsNullOrWhiteSpace($currentRefreshToken)) {
+  Write-Host '==> Bootstrapping fresh access token from REFRESH_TOKEN'
+  $refreshAttemptCount++
+  $bootstrap = Invoke-RefreshTokenExchange -NormalizedBaseUrl $normalizedBaseUrl -CurrentRefreshToken $currentRefreshToken
+  $currentAccessToken = $bootstrap.AccessToken
+  $currentRefreshToken = $bootstrap.RefreshToken
+  $refreshSuccessCount++
+}
+
+Require-Value 'ACCESS_TOKEN' $currentAccessToken
+
+if ([string]::IsNullOrWhiteSpace($currentRefreshToken)) {
+  Write-Warning 'REFRESH_TOKEN not provided. ACCESS_TOKEN-only mode may fail on longer multi-step runs if the token expires.'
+}
 
 $timestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 $runDir = Join-Path $OutputDir "run-$timestamp"
@@ -143,7 +223,16 @@ $steps = @(
 
 $executions = @()
 foreach ($step in $steps) {
-  $executions += Run-K6Step -Name $step.Name -ScriptFile $step.Script -Profile $step.Profile -P95LimitMs $step.P95Limit -ExtraEnv $step.ExtraEnv -RunDir $runDir
+  if (-not [string]::IsNullOrWhiteSpace($currentRefreshToken)) {
+    Write-Host "==> Refreshing auth before $($step.Name)"
+    $refreshAttemptCount++
+    $refreshResult = Invoke-RefreshTokenExchange -NormalizedBaseUrl $normalizedBaseUrl -CurrentRefreshToken $currentRefreshToken
+    $currentAccessToken = $refreshResult.AccessToken
+    $currentRefreshToken = $refreshResult.RefreshToken
+    $refreshSuccessCount++
+  }
+
+  $executions += Run-K6Step -Name $step.Name -ScriptFile $step.Script -Profile $step.Profile -P95LimitMs $step.P95Limit -ExtraEnv $step.ExtraEnv -RunDir $runDir -NormalizedBaseUrl $normalizedBaseUrl -CurrentAccessToken $currentAccessToken
 }
 
 $results = $executions | ForEach-Object { $_.Result }
@@ -200,7 +289,6 @@ $baselineRows = New-HtmlRows $groupedResults['baseline']
 $loadRows = New-HtmlRows $groupedResults['load']
 $spikeRows = New-HtmlRows $groupedResults['spike']
 
-
 $groupStatus = @{}
 foreach ($groupKey in @('baseline', 'load', 'spike')) {
   $groupItems = $groupedResults[$groupKey]
@@ -215,8 +303,11 @@ $md = @()
 $md += '# RejuvMe Pressure Test Report'
 $md += ''
 $md += "- Generated at: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
-$md += "- BASE_URL: `$BaseUrl`"
+$md += "- BASE_URL: `$normalizedBaseUrl`"
 $md += "- SEARCH_QUERY: `$SearchQuery`"
+$md += "- Auth mode: `$authMode`"
+$md += "- Refresh attempts: `$(To-Int $refreshAttemptCount)`"
+$md += "- Refresh successes: `$(To-Int $refreshSuccessCount)`"
 $md += "- Overall result: **$(if ($overallPass) { 'PASS' } else { 'FAIL' })**"
 $md += ''
 $md += '## Scope'
@@ -277,7 +368,7 @@ foreach ($groupKey in @('baseline', 'load', 'spike')) {
 
 $md -join "`r`n" | Set-Content -Path $reportMd
 
-function Convert-MarkdownToHtml([string]$BaseUrl, [string]$SearchQuery, [bool]$OverallPass, $BaselineRows, $LoadRows, $SpikeRows) {
+function Convert-MarkdownToHtml([string]$BaseUrlValue, [string]$SearchQueryValue, [bool]$OverallPassValue, $BaselineRowsValue, $LoadRowsValue, $SpikeRowsValue, [string]$AuthModeValue, [int]$RefreshAttemptsValue, [int]$RefreshSuccessesValue) {
   return @"
 <!doctype html>
 <html>
@@ -298,9 +389,12 @@ function Convert-MarkdownToHtml([string]$BaseUrl, [string]$SearchQuery, [bool]$O
 <body>
   <h1>RejuvMe Pressure Test Report</h1>
   <p><strong>Generated at:</strong> $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')</p>
-  <p><strong>BASE_URL:</strong> <code>$BaseUrl</code></p>
-  <p><strong>SEARCH_QUERY:</strong> <code>$SearchQuery</code></p>
-  <p><strong>Overall result:</strong> <span class='$(if ($OverallPass) { 'pass' } else { 'fail' })'>$(if ($OverallPass) { 'PASS' } else { 'FAIL' })</span></p>
+  <p><strong>BASE_URL:</strong> <code>$BaseUrlValue</code></p>
+  <p><strong>SEARCH_QUERY:</strong> <code>$SearchQueryValue</code></p>
+  <p><strong>Auth mode:</strong> <code>$AuthModeValue</code></p>
+  <p><strong>Refresh attempts:</strong> <code>$RefreshAttemptsValue</code></p>
+  <p><strong>Refresh successes:</strong> <code>$RefreshSuccessesValue</code></p>
+  <p><strong>Overall result:</strong> <span class='$(if ($OverallPassValue) { 'pass' } else { 'fail' })'>$(if ($OverallPassValue) { 'PASS' } else { 'FAIL' })</span></p>
 
   <h2>Scope</h2>
   <ul>
@@ -321,7 +415,7 @@ function Convert-MarkdownToHtml([string]$BaseUrl, [string]$SearchQuery, [bool]$O
       </tr>
     </thead>
     <tbody>
-      $($BaselineRows -join "`n      ")
+      $($BaselineRowsValue -join "`n      ")
     </tbody>
   </table>
 
@@ -335,7 +429,7 @@ function Convert-MarkdownToHtml([string]$BaseUrl, [string]$SearchQuery, [bool]$O
       </tr>
     </thead>
     <tbody>
-      $($LoadRows -join "`n      ")
+      $($LoadRowsValue -join "`n      ")
     </tbody>
   </table>
 
@@ -349,7 +443,7 @@ function Convert-MarkdownToHtml([string]$BaseUrl, [string]$SearchQuery, [bool]$O
       </tr>
     </thead>
     <tbody>
-      $($SpikeRows -join "`n      ")
+      $($SpikeRowsValue -join "`n      ")
     </tbody>
   </table>
 </body>
@@ -357,15 +451,19 @@ function Convert-MarkdownToHtml([string]$BaseUrl, [string]$SearchQuery, [bool]$O
 "@
 }
 
-Convert-MarkdownToHtml -BaseUrl $BaseUrl -SearchQuery $SearchQuery -OverallPass $overallPass -BaselineRows $baselineRows -LoadRows $loadRows -SpikeRows $spikeRows | Set-Content -Path $reportHtml
+Convert-MarkdownToHtml -BaseUrlValue $normalizedBaseUrl -SearchQueryValue $SearchQuery -OverallPassValue $overallPass -BaselineRowsValue $baselineRows -LoadRowsValue $loadRows -SpikeRowsValue $spikeRows -AuthModeValue $authMode -RefreshAttemptsValue $refreshAttemptCount -RefreshSuccessesValue $refreshSuccessCount | Set-Content -Path $reportHtml
 
 Write-Host ''
 Write-Host 'Completed full 9-case pressure test sequence.'
 Write-Host "Markdown report: $reportMd"
 Write-Host "HTML report: $reportHtml"
+Write-Host "Auth mode: $authMode"
+Write-Host "Refresh attempts: $refreshAttemptCount"
+Write-Host "Refresh successes: $refreshSuccessCount"
 Write-Host "Overall result: $(if ($overallPass) { 'PASS' } else { 'FAIL' })"
 
 if ($OpenReport) {
   Start-Process $reportHtml
 }
+
 
